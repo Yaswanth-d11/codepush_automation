@@ -10,6 +10,7 @@ def add_numbers(a, b):
 
 def is_even(number):
     """Checks if a number is even."""
+    print(f"Checking if {number} is even")
     return number % 2 == 0
 
 
