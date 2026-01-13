@@ -20,6 +20,7 @@ def get_square(number):
 
 def reverse_string(text):
     """Reverses a string."""
+    print(f"Reversing string: {text}")
     return text[::-1]
 
 
