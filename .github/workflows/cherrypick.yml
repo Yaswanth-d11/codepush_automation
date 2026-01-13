@@ -1,0 +1,428 @@
+name: Cherrypick Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      codepush_branch:
+        description: "Codepush branch (defaults to current branch if not provided)"
+        required: false
+        type: string
+      app_version:
+        description: "App version in Semantic versioning format (Major.Minor.Patch, e.g., 2.1.19)"
+        required: true
+        type: string
+      sorting_base_branch:
+        description: "Base branch for sorting PRs by merge time (defaults to 'main', use 'test-main' or other for testing)"
+        required: false
+        type: string
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  cherrypick:
+    name: Cherry-pick PRs by Label
+    runs-on: ubuntu-latest
+    outputs:
+      success_count: ${{ steps.cherrypick.outputs.success_count }}
+      conflict_count: ${{ steps.cherrypick.outputs.conflict_count }}
+      native_changes_count: ${{ steps.cherrypick.outputs.native_changes_count }}
+      success_prs: ${{ steps.cherrypick.outputs.success_prs }}
+      conflict_prs: ${{ steps.cherrypick.outputs.conflict_prs }}
+      native_changes_prs: ${{ steps.cherrypick.outputs.native_changes_prs }}
+      merge_order: ${{ steps.cherrypick_exec.outputs.merge_order }}
+    env:
+      GIT_TOKEN: ${{ secrets.COMMIT_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ env.GIT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine codepush branch
+        id: branch
+        run: |
+          if [ -n "${{ github.event.inputs.codepush_branch }}" ]; then
+            CODEPUSH_BRANCH="${{ github.event.inputs.codepush_branch }}"
+          else
+            CODEPUSH_BRANCH="${{ github.ref_name }}"
+          fi
+          echo "branch=${CODEPUSH_BRANCH}" >> $GITHUB_OUTPUT
+          echo "Using codepush branch: ${CODEPUSH_BRANCH}"
+
+      - name: Check if codepush branch exists
+        id: check_branch
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          
+          # Check if branch exists locally or remotely
+          if git show-ref --verify --quiet refs/heads/"${BRANCH}" || git ls-remote --exit-code --heads origin "${BRANCH}" > /dev/null 2>&1; then
+            echo "✅ Branch ${BRANCH} exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Error: Codepush branch '${BRANCH}' does not exist. Please create the branch first."
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Checkout codepush branch
+        if: steps.check_branch.outputs.exists == 'true'
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          git fetch origin "${BRANCH}"
+          git checkout "${BRANCH}"
+
+      - name: Find and process PRs with label
+        id: cherrypick
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GIT_TOKEN }}
+          script: |
+            const appVersion = '${{ github.event.inputs.app_version }}';
+            const labelName = `cp_${appVersion}`;
+            const codepushBranch = '${{ steps.branch.outputs.branch }}';
+            const sortingBaseBranch = '${{ github.event.inputs.sorting_base_branch || 'main' }}';
+            
+            console.log(`Looking for PRs with label: ${labelName}`);
+            console.log(`Sorting base branch: ${sortingBaseBranch}`);
+            
+            // Find all PRs with the label
+            const { data: prs } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: labelName,
+              state: 'closed',
+              per_page: 100
+            });
+            
+            // Filter to only pull requests (not issues)
+            const pullRequests = prs.filter(issue => issue.pull_request);
+            
+            console.log(`Found ${pullRequests.length} PRs with label ${labelName}`);
+            
+            if (pullRequests.length === 0) {
+              console.log('No PRs found with the specified label');
+              core.setOutput('success_count', '0');
+              core.setOutput('conflict_count', '0');
+              core.setOutput('native_changes_count', '0');
+              core.setOutput('success_prs', '[]');
+              core.setOutput('conflict_prs', '[]');
+              core.setOutput('native_changes_prs', '[]');
+              core.setOutput('prs_to_cherrypick', '[]');
+              core.setOutput('prs_with_native_changes', '[]');
+              return;
+            }
+            
+            // Get detailed PR information
+            const prsWithNativeChanges = [];
+            const prsToCherrypick = [];
+            
+            for (const pr of pullRequests) {
+              try {
+                // Get full PR details
+                const { data: prDetail } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                
+                // Check if PR is merged
+                if (!prDetail.merged_at) {
+                  console.log(`PR #${pr.number} is not merged, skipping`);
+                  continue;
+                }
+                
+                // Get PR files to check for native changes
+                const { data: files } = await github.rest.pulls.listFiles({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                
+                // Check for native changes
+                const hasNativeChanges = files.some(file => 
+                  file.filename.startsWith('android/') || 
+                  file.filename.startsWith('ios/')
+                );
+                
+                // Get merge commit SHA
+                const mergeCommitSha = prDetail.merge_commit_sha;
+                
+                // Get merge commit timestamp from the base branch context
+                let mergeTimestamp;
+                try {
+                  // First, get the commit details
+                  const { data: mergeCommit } = await github.rest.git.getCommit({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    commit_sha: mergeCommitSha
+                  });
+                  
+                  // Try to get the merge order from the base branch
+                  // Check if this commit exists in the base branch
+                  try {
+                    const { data: branchCommits } = await github.rest.repos.listCommits({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      sha: sortingBaseBranch,
+                      per_page: 100
+                    });
+                    
+                    // Find when this commit appears in the base branch history
+                    const commitIndex = branchCommits.findIndex(commit => commit.sha === mergeCommitSha);
+                    if (commitIndex !== -1) {
+                      // Use the commit's date from the base branch
+                      mergeTimestamp = branchCommits[commitIndex].commit.committer.date;
+                      console.log(`PR #${pr.number} found in ${sortingBaseBranch} at position ${commitIndex + 1}`);
+                    } else {
+                      // Fallback to commit timestamp if not found in base branch
+                      mergeTimestamp = mergeCommit.committer.date;
+                      console.log(`PR #${pr.number} merge commit not found in ${sortingBaseBranch}, using commit timestamp`);
+                    }
+                  } catch (branchError) {
+                    // If base branch doesn't exist or error, use commit timestamp
+                    mergeTimestamp = mergeCommit.committer.date;
+                    console.log(`Error checking ${sortingBaseBranch} for PR #${pr.number}: ${branchError.message}, using commit timestamp`);
+                  }
+                } catch (error) {
+                  console.error(`Error getting merge commit for PR #${pr.number}: ${error.message}`);
+                  // Fallback: use PR merge time if available
+                  mergeTimestamp = prDetail.merged_at || new Date().toISOString();
+                }
+                
+                const prInfo = {
+                  number: pr.number,
+                  title: prDetail.title,
+                  author: prDetail.user.login,
+                  mergeCommitSha: mergeCommitSha,
+                  mergeTimestamp: mergeTimestamp,
+                  hasNativeChanges: hasNativeChanges,
+                  url: prDetail.html_url
+                };
+                
+                if (hasNativeChanges) {
+                  prsWithNativeChanges.push(prInfo);
+                  console.log(`PR #${pr.number} has native changes, will be discarded`);
+                } else {
+                  prsToCherrypick.push(prInfo);
+                }
+              } catch (error) {
+                console.error(`Error processing PR #${pr.number}: ${error.message}`);
+              }
+            }
+            
+            // Sort PRs by merge timestamp from base branch (earliest first)
+            prsToCherrypick.sort((a, b) => 
+              new Date(a.mergeTimestamp) - new Date(b.mergeTimestamp)
+            );
+            
+            console.log(`PRs to cherry-pick (${prsToCherrypick.length}) sorted by merge time in ${sortingBaseBranch}:`);
+            prsToCherrypick.forEach((pr, index) => {
+              console.log(`  - Order ${index + 1}: PR #${pr.number}: ${pr.title} (merged at ${pr.mergeTimestamp})`);
+            });
+            
+            console.log(`PRs with native changes (${prsWithNativeChanges.length}):`);
+            prsWithNativeChanges.forEach(pr => {
+              console.log(`  - PR #${pr.number}: ${pr.title}`);
+            });
+            
+            // Store results for later steps
+            core.setOutput('prs_to_cherrypick', JSON.stringify(prsToCherrypick));
+            core.setOutput('prs_with_native_changes', JSON.stringify(prsWithNativeChanges));
+            core.setOutput('native_changes_count', prsWithNativeChanges.length.toString());
+
+      - name: Cherry-pick PRs
+        id: cherrypick_exec
+        if: steps.cherrypick.outputs.prs_to_cherrypick != '' && steps.cherrypick.outputs.prs_to_cherrypick != '[]'
+        run: |
+          PRS_TO_CHERRYPICK='${{ steps.cherrypick.outputs.prs_to_cherrypick }}'
+          
+          SUCCESSFUL_PRS=()
+          CONFLICT_PRS=()
+          ORDER=1
+          
+          # Read PRs array using jq
+          PR_COUNT=$(echo "$PRS_TO_CHERRYPICK" | jq 'length')
+          
+          for ((i=0; i<$PR_COUNT; i++)); do
+            PR_NUMBER=$(echo "$PRS_TO_CHERRYPICK" | jq -r ".[$i].number")
+            PR_TITLE=$(echo "$PRS_TO_CHERRYPICK" | jq -r ".[$i].title")
+            PR_AUTHOR=$(echo "$PRS_TO_CHERRYPICK" | jq -r ".[$i].author")
+            MERGE_COMMIT=$(echo "$PRS_TO_CHERRYPICK" | jq -r ".[$i].mergeCommitSha")
+            
+            echo "Cherry-picking PR #${PR_NUMBER}: ${PR_TITLE}"
+            echo "Merge commit: ${MERGE_COMMIT}"
+            
+            # Attempt cherry-pick
+            if git cherry-pick -m 1 "${MERGE_COMMIT}" 2>&1; then
+              echo "✅ Successfully cherry-picked PR #${PR_NUMBER} (Order: ${ORDER})"
+              # Escape quotes in title for JSON
+              ESCAPED_TITLE=$(echo "${PR_TITLE}" | sed 's/"/\\"/g')
+              SUCCESSFUL_PRS+=("{\"number\":${PR_NUMBER},\"title\":\"${ESCAPED_TITLE}\",\"author\":\"${PR_AUTHOR}\",\"commit\":\"${MERGE_COMMIT}\",\"order\":${ORDER}}")
+              ORDER=$((ORDER + 1))
+            else
+              CHERRY_PICK_STATUS=$?
+              echo "❌ Merge conflict in PR #${PR_NUMBER}"
+              
+              # Abort the cherry-pick
+              git cherry-pick --abort 2>/dev/null || true
+              
+              # Reset any uncommitted changes
+              git reset --hard HEAD 2>/dev/null || true
+              git clean -fd 2>/dev/null || true
+              
+              # Escape quotes in title for JSON
+              ESCAPED_TITLE=$(echo "${PR_TITLE}" | sed 's/"/\\"/g')
+              CONFLICT_PRS+=("{\"number\":${PR_NUMBER},\"title\":\"${ESCAPED_TITLE}\",\"author\":\"${PR_AUTHOR}\",\"commit\":\"${MERGE_COMMIT}\"}")
+            fi
+          done
+          
+          # Output results as JSON arrays
+          if [ ${#SUCCESSFUL_PRS[@]} -gt 0 ]; then
+            echo "success_prs=[$(IFS=,; echo "${SUCCESSFUL_PRS[*]}")]" >> $GITHUB_OUTPUT
+            # Create merge order list (just PR numbers in order)
+            MERGE_ORDER=$(echo "[$(IFS=,; echo "${SUCCESSFUL_PRS[*]}")]" | jq -r '[.[] | .number] | join(",")')
+            echo "merge_order=${MERGE_ORDER}" >> $GITHUB_OUTPUT
+          else
+            echo "success_prs=[]" >> $GITHUB_OUTPUT
+            echo "merge_order=" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ ${#CONFLICT_PRS[@]} -gt 0 ]; then
+            echo "conflict_prs=[$(IFS=,; echo "${CONFLICT_PRS[*]}")]" >> $GITHUB_OUTPUT
+          else
+            echo "conflict_prs=[]" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "success_count=${#SUCCESSFUL_PRS[@]}" >> $GITHUB_OUTPUT
+          echo "conflict_count=${#CONFLICT_PRS[@]}" >> $GITHUB_OUTPUT
+
+      - name: Verify cherry-picked commits
+        if: steps.cherrypick_exec.outputs.success_count > 0
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          echo "📋 Recent commits on ${BRANCH} branch:"
+          echo ""
+          git log --oneline -10
+          echo ""
+          echo "✅ Cherry-picked commits are ready to be pushed"
+
+      - name: Push cherry-picked commits to codepush branch
+        if: steps.cherrypick_exec.outputs.success_count > 0 && steps.cherrypick_exec.outputs.conflict_count == 0
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          echo "Pushing cherry-picked commits to ${BRANCH}..."
+          git push origin "${BRANCH}"
+          echo "✅ Successfully pushed commits to ${BRANCH}"
+
+      - name: Create workflow summary
+        if: always()
+        run: |
+          APP_VERSION="${{ github.event.inputs.app_version }}"
+          CODEPUSH_BRANCH="${{ steps.branch.outputs.branch }}"
+          LABEL_NAME="cp_${APP_VERSION}"
+          
+          SUCCESS_COUNT="${{ steps.cherrypick_exec.outputs.success_count || '0' }}"
+          CONFLICT_COUNT="${{ steps.cherrypick_exec.outputs.conflict_count || '0' }}"
+          NATIVE_CHANGES_COUNT="${{ steps.cherrypick.outputs.native_changes_count || '0' }}"
+          
+          SORTING_BASE_BRANCH="${{ github.event.inputs.sorting_base_branch || 'main' }}"
+          
+          echo "## 🍒 Cherrypick Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **App Version**: ${APP_VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Label**: \`${LABEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Codepush Branch**: \`${CODEPUSH_BRANCH}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sorting Base Branch**: \`${SORTING_BASE_BRANCH}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **Successfully Cherry-picked**: ${SUCCESS_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **Merge Conflicts**: ${CONFLICT_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🚫 **Discarded (Native Changes)**: ${NATIVE_CHANGES_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse and display successful PRs with merge order
+          SUCCESS_PRS='${{ steps.cherrypick_exec.outputs.success_prs }}'
+          MERGE_ORDER='${{ steps.cherrypick_exec.outputs.merge_order }}'
+          if [ -n "$SUCCESS_PRS" ] && [ "$SUCCESS_PRS" != "[]" ]; then
+            echo "### ✅ Successfully Cherry-picked PRs (in merge order)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "$SUCCESS_PRS" | jq -r '.[] | "- **Order \(.order)**: PR #\(.number) - \(.title) (by @\(.author)) - Commit: `\(.commit[0:7])`"' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -n "$MERGE_ORDER" ]; then
+              echo "**Merge Order**: \`${MERGE_ORDER}\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # Parse and display conflict PRs
+          CONFLICT_PRS='${{ steps.cherrypick_exec.outputs.conflict_prs }}'
+          if [ -n "$CONFLICT_PRS" ] && [ "$CONFLICT_PRS" != "[]" ]; then
+            echo "### ⚠️ PRs with Merge Conflicts" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "$CONFLICT_PRS" | jq -r '.[] | "- **PR #\(.number)**: \(.title) (by @\(.author)) - Commit: `\(.commit[0:7])`"' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ These PRs need to be manually cherry-picked with conflicts resolved." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Parse and display native changes PRs
+          NATIVE_PRS='${{ steps.cherrypick.outputs.prs_with_native_changes }}'
+          if [ -n "$NATIVE_PRS" ] && [ "$NATIVE_PRS" != "[]" ]; then
+            echo "### 🚫 PRs Discarded (Native Changes)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "$NATIVE_PRS" | jq -r '.[] | "- **PR #\(.number)**: \(.title) (by @\(.author))"' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ℹ️ These PRs contain changes in \`android/\` or \`ios/\` folders and cannot be cherry-picked." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Overall status
+          if [ "$CONFLICT_COUNT" -gt 0 ]; then
+            echo "### ❌ Workflow Status: Failed (Merge Conflicts)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The workflow encountered merge conflicts. Please resolve them manually and create new PRs against the codepush branch." >> $GITHUB_STEP_SUMMARY
+          elif [ "$SUCCESS_COUNT" -gt 0 ]; then
+            echo "### ✅ Workflow Status: Success" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            CONFLICT_COUNT_VALUE="${{ steps.cherrypick_exec.outputs.conflict_count || '0' }}"
+            if [ "$CONFLICT_COUNT_VALUE" == "0" ]; then
+              echo "All eligible PRs were successfully cherry-picked and pushed to the codepush branch." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Some PRs were successfully cherry-picked. Please resolve conflicts and push manually." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "### ℹ️ Workflow Status: No PRs to Cherry-pick" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Set job outputs
+        if: always()
+        run: |
+          SUCCESS_COUNT="${{ steps.cherrypick_exec.outputs.success_count || '0' }}"
+          CONFLICT_COUNT="${{ steps.cherrypick_exec.outputs.conflict_count || '0' }}"
+          NATIVE_CHANGES_COUNT="${{ steps.cherrypick.outputs.native_changes_count || '0' }}"
+          
+          echo "success_count=${SUCCESS_COUNT}" >> $GITHUB_OUTPUT
+          echo "conflict_count=${CONFLICT_COUNT}" >> $GITHUB_OUTPUT
+          echo "native_changes_count=${NATIVE_CHANGES_COUNT}" >> $GITHUB_OUTPUT
+          echo "success_prs=${{ steps.cherrypick_exec.outputs.success_prs || '[]' }}" >> $GITHUB_OUTPUT
+          echo "conflict_prs=${{ steps.cherrypick_exec.outputs.conflict_prs || '[]' }}" >> $GITHUB_OUTPUT
+          echo "native_changes_prs=${{ steps.cherrypick.outputs.prs_with_native_changes || '[]' }}" >> $GITHUB_OUTPUT
+          echo "merge_order=${{ steps.cherrypick_exec.outputs.merge_order || '' }}" >> $GITHUB_OUTPUT
+
+      - name: Fail workflow if conflicts exist
+        if: steps.cherrypick_exec.outputs.conflict_count > 0
+        run: |
+          echo "❌ Workflow failed due to merge conflicts"
+          exit 1
+
