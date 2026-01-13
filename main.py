@@ -15,6 +15,7 @@ def is_even(number):
 
 def get_square(number):
     """Returns the square of a number."""
+    print(f"Calculating square of {number}")
     return number ** 2
 
 
