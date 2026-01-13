@@ -25,6 +25,7 @@ def reverse_string(text):
 
 def calculate_area(length, width):
     """Calculates the area of a rectangle."""
+    print(f"Calculating area with length {length} and width {width}")
     return length * width
 
 
