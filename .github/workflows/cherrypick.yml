@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: "main"
+      notify_slack:
+        description: "Send Slack notification about workflow status"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -435,6 +440,30 @@ jobs:
           echo "conflict_prs=${{ steps.cherrypick_exec.outputs.conflict_prs || '[]' }}" >> $GITHUB_OUTPUT
           echo "native_changes_prs=${{ steps.cherrypick.outputs.prs_with_native_changes || '[]' }}" >> $GITHUB_OUTPUT
           echo "merge_order=${{ steps.cherrypick_exec.outputs.merge_order || '' }}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        if: github.event.inputs.notify_slack == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Send Slack notification
+        if: github.event.inputs.notify_slack == 'true'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+        run: |
+          node scripts/cherrypick-slack-notification.js \
+            --app-version "${{ github.event.inputs.app_version }}" \
+            --codepush-branch "${{ steps.branch.outputs.branch }}" \
+            --success-prs '${{ steps.cherrypick_exec.outputs.success_prs || '[]' }}' \
+            --conflict-prs '${{ steps.cherrypick_exec.outputs.conflict_prs || '[]' }}' \
+            --native-prs '${{ steps.cherrypick.outputs.prs_with_native_changes || '[]' }}' \
+            --success-count "${{ steps.cherrypick_exec.outputs.success_count || '0' }}" \
+            --conflict-count "${{ steps.cherrypick_exec.outputs.conflict_count || '0' }}" \
+            --native-count "${{ steps.cherrypick.outputs.native_changes_count || '0' }}" \
+            --workflow-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        continue-on-error: true
 
       - name: Fail workflow if conflicts exist
         if: steps.cherrypick_exec.outputs.conflict_count > 0
