@@ -20,7 +20,7 @@ on:
 permissions:
   contents: write
   pull-requests: read
-  issues: read
+  issues: write
 
 jobs:
   cherrypick:
@@ -245,6 +245,9 @@ jobs:
         if: steps.cherrypick.outputs.prs_to_cherrypick != '' && steps.cherrypick.outputs.prs_to_cherrypick != '[]'
         run: |
           PRS_TO_CHERRYPICK='${{ steps.cherrypick.outputs.prs_to_cherrypick }}'
+          APP_VERSION="${{ github.event.inputs.app_version }}"
+          LABEL_NAME="cp_${APP_VERSION}"
+          REPO_FULL="${{ github.repository }}"
           
           SUCCESSFUL_PRS=()
           CONFLICT_PRS=()
@@ -265,6 +268,19 @@ jobs:
             # Attempt cherry-pick
             if git cherry-pick -m 1 "${MERGE_COMMIT}" 2>&1; then
               echo "✅ Successfully cherry-picked PR #${PR_NUMBER} (Order: ${ORDER})"
+              
+              # Remove label from PR after successful cherry-pick
+              echo "Removing label '${LABEL_NAME}' from PR #${PR_NUMBER}..."
+              LABEL_ENCODED=$(echo "${LABEL_NAME}" | sed 's/ /%20/g')
+              if curl -s -X DELETE \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Authorization: token ${GIT_TOKEN}" \
+                "https://api.github.com/repos/${REPO_FULL}/issues/${PR_NUMBER}/labels/${LABEL_ENCODED}" > /dev/null; then
+                echo "✅ Successfully removed label '${LABEL_NAME}' from PR #${PR_NUMBER}"
+              else
+                echo "⚠️ Warning: Failed to remove label '${LABEL_NAME}' from PR #${PR_NUMBER} (continuing anyway)"
+              fi
+              
               # Escape quotes in title for JSON
               ESCAPED_TITLE=$(echo "${PR_TITLE}" | sed 's/"/\\"/g')
               SUCCESSFUL_PRS+=("{\"number\":${PR_NUMBER},\"title\":\"${ESCAPED_TITLE}\",\"author\":\"${PR_AUTHOR}\",\"commit\":\"${MERGE_COMMIT}\",\"order\":${ORDER}}")
