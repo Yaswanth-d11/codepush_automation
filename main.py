@@ -5,6 +5,7 @@ def greet(name):
 
 def add_numbers(a, b):
     """Adds two numbers together."""
+    print(f"a: {a}, b: {b}")
     return a + b
 
 
