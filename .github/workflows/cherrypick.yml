@@ -164,6 +164,7 @@ jobs:
                 
                 // Get merge commit timestamp from the base branch context
                 let mergeTimestamp;
+                let authorEmail = null;
                 try {
                   // First, get the commit details
                   const { data: mergeCommit } = await github.rest.git.getCommit({
@@ -171,6 +172,9 @@ jobs:
                     repo: context.repo.repo,
                     commit_sha: mergeCommitSha
                   });
+                  
+                  // Get author email from commit
+                  authorEmail = mergeCommit.author?.email || mergeCommit.committer?.email || null;
                   
                   // Try to get the merge order from the base branch
                   // Check if this commit exists in the base branch
@@ -202,12 +206,19 @@ jobs:
                   console.error(`Error getting merge commit for PR #${pr.number}: ${error.message}`);
                   // Fallback: use PR merge time if available
                   mergeTimestamp = prDetail.merged_at || new Date().toISOString();
+                  // Try to get email from PR user if commit lookup failed
+                  if (!authorEmail && prDetail.user) {
+                    // Note: GitHub API doesn't expose user email directly, so this will be null
+                    // The email will come from the commit if available
+                    authorEmail = null;
+                  }
                 }
                 
                 const prInfo = {
                   number: pr.number,
                   title: prDetail.title,
                   author: prDetail.user.login,
+                  email: authorEmail,
                   mergeCommitSha: mergeCommitSha,
                   mergeTimestamp: mergeTimestamp,
                   hasNativeChanges: hasNativeChanges,

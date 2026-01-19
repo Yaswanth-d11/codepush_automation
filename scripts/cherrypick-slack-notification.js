@@ -38,6 +38,18 @@ function parseArgs() {
 }
 
 /**
+ * Format user mention for Slack
+ */
+function formatUserMention(slackUserId, fallbackUsername) {
+  // If it's a Slack user ID (starts with U), use it directly
+  if (slackUserId && slackUserId.startsWith('U')) {
+    return `<@${slackUserId}>`;
+  }
+  // Otherwise, try username (might work if GitHub username matches Slack username)
+  return `<@${slackUserId || fallbackUsername}>`;
+}
+
+/**
  * Create Slack message blocks for cherrypick workflow
  */
 function createSlackBlocks(options) {
@@ -118,7 +130,7 @@ function createSlackBlocks(options) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*🚫 PRs Discarded (Native Changes)*\n${nativePrs.map(pr => `• PR #${pr.number}: ${pr.title} (by @${pr.author})`).join('\n')}`
+        text: `*🚫 PRs Discarded (Native Changes)*\n${nativePrs.map(pr => `• PR #${pr.number}: ${pr.title} (by ${formatUserMention(pr.slackUserId, pr.author)})`).join('\n')}`
       }
     });
     blocks.push({
@@ -139,7 +151,7 @@ function createSlackBlocks(options) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*⚠️ PRs with Merge Conflicts*\n${conflictPrs.map(pr => `• PR #${pr.number}: ${pr.title} (by @${pr.author}) - Commit: \`${pr.commit.substring(0, 7)}\``).join('\n')}`
+        text: `*⚠️ PRs with Merge Conflicts*\n${conflictPrs.map(pr => `• PR #${pr.number}: ${pr.title} (by ${formatUserMention(pr.slackUserId, pr.author)}) - Commit: \`${pr.commit.substring(0, 7)}\``).join('\n')}`
       }
     });
     blocks.push({
@@ -158,7 +170,7 @@ function createSlackBlocks(options) {
     blocks.push({ type: 'divider' });
     const successText = successPrs.map((pr, index) => {
       const order = pr.order || (index + 1);
-      return `• *Order ${order}*: PR #${pr.number} - ${pr.title} (by @${pr.author}) - Commit: \`${pr.commit.substring(0, 7)}\``;
+      return `• *Order ${order}*: PR #${pr.number} - ${pr.title} (by ${formatUserMention(pr.slackUserId, pr.author)}) - Commit: \`${pr.commit.substring(0, 7)}\``;
     }).join('\n');
     
     blocks.push({
@@ -191,6 +203,111 @@ function createSlackBlocks(options) {
   }
 
   return blocks;
+}
+
+/**
+ * Lookup Slack user by email
+ */
+function lookupSlackUserByEmail(email) {
+  return new Promise((resolve, reject) => {
+    const botToken = process.env.SLACK_BOT_TOKEN;
+    
+    if (!botToken) {
+      reject(new Error('SLACK_BOT_TOKEN environment variable is required'));
+      return;
+    }
+    
+    if (!email) {
+      resolve(null);
+      return;
+    }
+    
+    // users.lookupByEmail is a GET request with email as query parameter
+    const encodedEmail = encodeURIComponent(email);
+    const options = {
+      hostname: 'slack.com',
+      port: 443,
+      path: `/api/users.lookupByEmail?email=${encodedEmail}`,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${botToken}`,
+        'Content-Type': 'application/json'
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          if (response.ok && response.user) {
+            resolve(response.user.id);
+          } else {
+            // User not found or error - return null to fallback to username
+            log.warn(`Slack user lookup failed for ${email}: ${response.error || 'user not found'}`);
+            resolve(null);
+          }
+        } catch (error) {
+          log.warn(`Failed to parse Slack lookup response: ${error.message}`);
+          resolve(null);
+        }
+      });
+    });
+    
+    req.on('error', (error) => {
+      log.warn(`Slack lookup request failed: ${error.message}`);
+      resolve(null);
+    });
+    
+    req.end();
+  });
+}
+
+/**
+ * Resolve user mentions - convert emails/usernames to Slack user IDs
+ */
+async function resolveUserMentions(prs) {
+  const userCache = {};
+  const resolvedPrs = [];
+  
+  // Hardcoded email mapping for testing
+  const hardcodedEmailMap = {
+    'Yaswanth-d11': 'yaswanthmotupalli45@gmail.com'
+  };
+  
+  for (const pr of prs) {
+    let slackUserId = null;
+    let emailToUse = pr.email;
+    
+    // Use hardcoded email if available for this user
+    if (hardcodedEmailMap[pr.author]) {
+      emailToUse = hardcodedEmailMap[pr.author];
+      log.info(`Using hardcoded email for ${pr.author}: ${emailToUse}`);
+    }
+    
+    // Try to lookup by email if available
+    if (emailToUse) {
+      if (userCache[emailToUse]) {
+        slackUserId = userCache[emailToUse];
+      } else {
+        slackUserId = await lookupSlackUserByEmail(emailToUse);
+        userCache[emailToUse] = slackUserId;
+      }
+    }
+    
+    // Fallback to username if email lookup failed
+    if (!slackUserId) {
+      slackUserId = pr.author;
+    }
+    
+    resolvedPrs.push({
+      ...pr,
+      slackUserId: slackUserId
+    });
+  }
+  
+  return resolvedPrs;
 }
 
 /**
@@ -306,13 +423,19 @@ async function main() {
     log.info(`Codepush Branch: ${options['codepush-branch']}`);
     log.info(`Success: ${successCount}, Conflicts: ${conflictCount}, Native: ${nativeCount}`);
     
+    // Resolve user mentions (lookup Slack user IDs from emails)
+    log.info('Resolving user mentions...');
+    const resolvedSuccessPrs = await resolveUserMentions(successPrs);
+    const resolvedConflictPrs = await resolveUserMentions(conflictPrs);
+    const resolvedNativePrs = await resolveUserMentions(nativePrs);
+    
     // Create Slack blocks
     const blocks = createSlackBlocks({
       appVersion: options['app-version'],
       codepushBranch: options['codepush-branch'],
-      successPrs,
-      conflictPrs,
-      nativePrs,
+      successPrs: resolvedSuccessPrs,
+      conflictPrs: resolvedConflictPrs,
+      nativePrs: resolvedNativePrs,
       successCount,
       conflictCount,
       nativeCount,
